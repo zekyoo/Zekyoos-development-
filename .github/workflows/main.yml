@@ -1,0 +1,173 @@
+name: Build VolTrace (.jar)
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build mod jar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cari folder project
+        shell: bash
+        run: |
+          set -e
+          FILE=$(find . -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "::error::settings.gradle tidak ditemukan. Pastikan isi project (src, build.gradle, gradlew, dst) ada di repo."
+            exit 1
+          fi
+          DIR=$(dirname "$FILE")
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Project ada di: $DIR"
+          ls -la "$DIR"
+
+      - name: Validasi Gradle wrapper (tidak memblokir build)
+        continue-on-error: true
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v5
+        with:
+          java-version: "25"
+          distribution: microsoft
+
+      - name: Siapkan Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+          sed -i 's/\r$//' gradlew 2>/dev/null || true
+          chmod +x gradlew 2>/dev/null || true
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+          else
+            V=$(grep -oE 'gradle-[0-9.]+-(bin|all)' gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -n 1 | sed -E 's/gradle-([0-9.]+)-.*/\1/' || true)
+            V=${V:-9.8.2}
+            echo "Wrapper tidak lengkap, memakai Gradle $V"
+            curl -fsSL "https://services.gradle.org/distributions/gradle-$V-bin.zip" -o "$RUNNER_TEMP/gradle.zip"
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+            echo "GRADLE_CMD=$RUNNER_TEMP/gradle-$V/bin/gradle" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build dengan Java 25
+        id: b25
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          export JAVA_HOME="${JAVA_HOME_25_X64:-$JAVA_HOME}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          $GRADLE_CMD clean build --stacktrace --console=plain --no-daemon --no-configuration-cache -Dorg.gradle.jvmargs="-Xmx3g" 2>&1 | tee "$GITHUB_WORKSPACE/build-java25.log"
+
+      - name: Build dengan Java 21 (cadangan kalau Java 25 gagal)
+        id: b21
+        if: steps.b25.outcome != 'success'
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          export JAVA_HOME="${JAVA_HOME_21_X64:-$JAVA_HOME}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          $GRADLE_CMD clean build --stacktrace --console=plain --no-daemon --no-configuration-cache -Dorg.gradle.jvmargs="-Xmx3g" 2>&1 | tee "$GITHUB_WORKSPACE/build-java21.log"
+
+      - name: Ambil file .jar
+        if: steps.b25.outcome == 'success' || steps.b21.outcome == 'success'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+          ls -la build/libs
+          JAR=$(ls build/libs/*.jar | grep -v -E -- '-(sources|dev|javadoc)\.jar$' | head -n 1)
+          JAR=$(realpath "$JAR")
+          echo "JAR=$JAR" >> "$GITHUB_ENV"
+          LIST=$(unzip -l "$JAR")
+          if ! grep -q "fabric.mod.json" <<< "$LIST"; then echo "::error::fabric.mod.json tidak ada di jar"; exit 1; fi
+          for f in com/voltrace/client/VolTraceClient.class assets/voltrace/shaders/lod/lod.frag client.voltrace.mixins.json; do
+            if ! grep -q "$f" <<< "$LIST"; then echo "::warning::$f tidak ditemukan di jar"; fi
+          done
+          if grep -q "com/terraformersmc" <<< "$LIST"; then echo "::warning::stub Mod Menu ikut masuk jar"; fi
+          {
+            echo "### Mod sudah jadi"
+            echo "File: \`$(basename "$JAR")\` ($(du -h "$JAR" | cut -f1))"
+            echo "Unduh dari bagian **Artifacts** di bawah halaman ini, atau dari tab **Releases** (branch utama / tag v*)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload jar (Artifacts)
+        if: env.JAR != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: VolTrace-mod-jar
+          path: ${{ env.JAR }}
+          if-no-files-found: error
+
+      - name: Ringkasan error (kalau build gagal)
+        if: always() && steps.b25.outcome != 'success' && steps.b21.outcome != 'success'
+        shell: bash
+        run: |
+          {
+            echo "## Build gagal - salin teks di bawah ini dan kirim ke Claude"
+            echo '```'
+            for f in build-java25.log build-java21.log; do
+              if [ -f "$f" ]; then
+                echo "--- $f ---"
+                grep -h -E "error:|FAILED|What went wrong|Caused by|Execution failed|Could not|cannot find symbol|does not exist|incompatible types|Unsupported|requires Java" "$f" | head -n 50 || true
+              fi
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log build
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: build-java*.log
+          if-no-files-found: ignore
+
+      - name: Publish ke Releases (branch utama / tag v*)
+        if: env.JAR != '' && github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            gh release create "$GITHUB_REF_NAME" "$JAR" --generate-notes --title "VolTrace $GITHUB_REF_NAME" || gh release upload "$GITHUB_REF_NAME" "$JAR" --clobber
+          elif [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            gh release delete latest --cleanup-tag --yes || true
+            gh release create latest "$JAR" --prerelease --title "VolTrace (build terbaru)" --notes "Build otomatis dari commit $GITHUB_SHA" --target "$GITHUB_SHA"
+          else
+            echo "Bukan branch utama atau tag: Release dilewati"
+          fi
+
+      - name: Tandai gagal bila kedua build gagal
+        if: steps.b25.outcome != 'success' && steps.b21.outcome != 'success'
+        run: |
+          echo "::error::Build gagal di Java 25 dan Java 21. Lihat bagian Summary untuk ringkasan error."
+          exit 1
