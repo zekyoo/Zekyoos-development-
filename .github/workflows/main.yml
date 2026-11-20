@@ -23,6 +23,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Ekstrak zip project (kalau project di-upload sebagai satu file .zip)
+        shell: bash
+        run: |
+          set -e
+          if [ -z "$(find . -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -not -path './.git/*' | head -n 1)" ]; then
+            Z=$(ls -1 ./*.zip 2>/dev/null | head -n 1 || true)
+            if [ -n "$Z" ]; then
+              echo "Mengekstrak $Z ke folder _project"
+              mkdir -p _project
+              unzip -q "$Z" -d _project
+            fi
+          fi
+
       - name: Cari folder project
         shell: bash
         run: |
