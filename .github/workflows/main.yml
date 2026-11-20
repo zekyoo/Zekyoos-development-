@@ -28,7 +28,7 @@ jobs:
         run: |
           set -e
           if [ -z "$(find . -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -not -path './.git/*' | head -n 1)" ]; then
-            Z=$(ls -1 ./*.zip 2>/dev/null | head -n 1 || true)
+            Z=$(ls -1 ./*.zip 2>/dev/null | sort -V | tail -n 1 || true)
             if [ -n "$Z" ]; then
               echo "Mengekstrak $Z ke folder _project"
               mkdir -p _project
